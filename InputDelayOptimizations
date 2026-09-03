@@ -266,18 +266,18 @@
         ctx.fillStyle = '#000000'; ctx.font = 'bold 13px monospace';
         ctx.fillText(`DETECTED BY EAC ON INJECT`, 10, 20);
         
-        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Network ━━`, 10, 45);
+        ctx.fillStyle = '#000000'; ctx.fillText(`we intercept wifi for ratting w worm`, 10, 45);
         ctx.fillStyle = '#fff';
         ctx.fillText(`Ping: ${STATE.latency.ping}ms`, 10, 60);
         ctx.fillText(`Total Comp: ${STATE.latency.total.toFixed(1)}ms`, 10, 75);
 
-        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Motion ━━`, 180, 45);
+        ctx.fillStyle = '#000000'; ctx.fillText(`━━ idfk ━━`, 180, 45);
         ctx.fillStyle = STATE.isLocked ? '#000000' : '#000000';
         ctx.fillText(`Mode: ${STATE.isLocked ? 'LOCKED' : 'MENU'}`, 180, 60);
         ctx.fillStyle = '#fff';
         ctx.fillText(`Vel: ${STATE.velocityMagnitude.toFixed(0)}px/s`, 180, 75);
 
-        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Performance ━━`, 10, 105);
+        ctx.fillStyle = '#000000'; ctx.fillText(`━━ aimmy.opensrc ━━`, 10, 105);
         ctx.fillStyle = '#fff';
         ctx.fillText(`FPS: ${STATE.metrics.fps}`, 10, 120);
         ctx.fillText(`Events: ${STATE.metrics.eventsDispatched}`, 180, 120);
