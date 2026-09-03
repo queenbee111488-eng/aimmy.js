@@ -3,9 +3,6 @@
 (function() {
     'use strict';
 
-    // ========================================================================
-    // CONFIGURATION (v3.0 Base)
-    // ========================================================================
     const CONFIG = {
         autoDetection: {
             enabled: true,
@@ -57,9 +54,7 @@
         }
     };
 
-    // ========================================================================
-    // STATE MANAGEMENT (Hybrid)
-    // ========================================================================
+
     const STATE = {
         position: { x: window.innerWidth/2, y: window.innerHeight/2 },
         velocity: { x: 0, y: 0 },
@@ -114,9 +109,6 @@
         vx: new KalmanFilter(), vy: new KalmanFilter()
     };
 
-    // ========================================================================
-    // AUTO PING DETECTION
-    // ========================================================================
     function updateNetworkStats() {
         if (!CONFIG.autoDetection.enabled) return;
         const statsElement = document.querySelector(CONFIG.autoDetection.statsSelector);
@@ -137,9 +129,6 @@
         }
     }
 
-    // ========================================================================
-    // ADVANCED MOTION TRACKING (Fixed for Pointer Lock)
-    // ========================================================================
     function updateMotionState(event) {
         const now = event.timeStamp || performance.now();
         const dt = Math.max(0.001, (now - STATE.lastTimestamp) / 1000);
@@ -274,34 +263,31 @@
         if (!STATE.overlayCtx) return;
         const ctx = STATE.overlayCtx;
         ctx.clearRect(0, 0, 350, 180);
-        ctx.fillStyle = '#00ff00'; ctx.font = 'bold 13px monospace';
-        ctx.fillText(`XCLOUD ULTRA OPTIMIZER v4.2`, 10, 20);
+        ctx.fillStyle = '#000000'; ctx.font = 'bold 13px monospace';
+        ctx.fillText(`DETECTED BY EAC ON INJECT`, 10, 20);
         
-        ctx.fillStyle = '#00ffff'; ctx.fillText(`━━ Network ━━`, 10, 45);
+        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Network ━━`, 10, 45);
         ctx.fillStyle = '#fff';
         ctx.fillText(`Ping: ${STATE.latency.ping}ms`, 10, 60);
         ctx.fillText(`Total Comp: ${STATE.latency.total.toFixed(1)}ms`, 10, 75);
 
-        ctx.fillStyle = '#00ffff'; ctx.fillText(`━━ Motion ━━`, 180, 45);
-        ctx.fillStyle = STATE.isLocked ? '#00ff00' : '#ffff00';
+        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Motion ━━`, 180, 45);
+        ctx.fillStyle = STATE.isLocked ? '#000000' : '#000000';
         ctx.fillText(`Mode: ${STATE.isLocked ? 'LOCKED' : 'MENU'}`, 180, 60);
         ctx.fillStyle = '#fff';
         ctx.fillText(`Vel: ${STATE.velocityMagnitude.toFixed(0)}px/s`, 180, 75);
 
-        ctx.fillStyle = '#00ffff'; ctx.fillText(`━━ Performance ━━`, 10, 105);
+        ctx.fillStyle = '#000000'; ctx.fillText(`━━ Performance ━━`, 10, 105);
         ctx.fillStyle = '#fff';
         ctx.fillText(`FPS: ${STATE.metrics.fps}`, 10, 120);
         ctx.fillText(`Events: ${STATE.metrics.eventsDispatched}`, 180, 120);
 
         // Movement Bar
         ctx.fillStyle = '#222'; ctx.fillRect(10, 140, 330, 10);
-        ctx.fillStyle = '#00ff00';
+        ctx.fillStyle = '#000000';
         ctx.fillRect(10, 140, Math.min(330, (STATE.velocityMagnitude / 2500) * 330), 10);
     }
 
-    // ========================================================================
-    // MAIN LOOP
-    // ========================================================================
     function mainLoop(timestamp) {
         STATE.metrics.framesThisSecond++;
         if (timestamp - STATE.metrics.lastFpsUpdate >= 1000) {
