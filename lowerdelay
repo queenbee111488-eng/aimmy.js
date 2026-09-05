@@ -1,0 +1,447 @@
+(() => {
+  'use strict';
+  const W = window;
+  const NAME = 'xcloudoptimizer';
+  const TAG = 'xcloudoptimizer/source-reviewed/1';
+  const log = (...args) => console.info(`[${NAME}]`, ...args);
+  const warn = (...args) => console.warn(`[${NAME}]`, ...args);
+  const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  const source = fn => typeof fn === 'function' ? Function.prototype.toString.call(fn) : '';
+  const finite = n => typeof n === 'number' && Number.isFinite(n);
+  const round = n => finite(n) ? Math.round(n * 1000) / 1000 : null;
+
+  if (!/(^|\.)xbox\.com$/i.test(location.hostname)) {
+    warn('Not an xbox.com page. Nothing was installed.');
+    return;
+  }
+  if (own(W, NAME)) {
+    if (W[NAME]?.tag === TAG) {
+      log('Already installed; not stacking hooks.');
+      return W[NAME].status();
+    }
+    warn('The name xcloudoptimizer is already in use. Nothing was overwritten.');
+    return;
+  }
+
+  let running = true;
+  let phase = 'waiting for a live game video';
+  let runtime;
+  let hook;
+  let discoveryTimer;
+  let noticeTimer;
+  let latencyEnabled = true;
+  let bufferTargetMs = 0;
+  let measuring = false;
+  let settingsVersion = 0;
+  let nextSessionId = 1;
+  const streams = new Map();
+  const changes = [];
+  const warned = new Set();
+  const waits = new Set();
+  let touched = new WeakMap();
+  const warnOnce = (key, message) => {
+    if (!warned.has(key)) { warned.add(key); warn(message); }
+  };
+
+  function requireRunning() {
+    if (!running) throw new Error('xcloudoptimizer has stopped. Paste the file again to reinstall.');
+  }
+
+  // Save exact own-property descriptors for SDK settings. For native accessors,
+  // restore through the native setter, never by creating/deleting an expando.
+  function edit(object, key, value, nativeAccessor = false) {
+    let keys = touched.get(object);
+    if (!keys) { keys = new Set(); touched.set(object, keys); }
+    if (keys.has(key)) return;
+    keys.add(key);
+    let before;
+    let descriptor;
+    try {
+      before = object[key];
+      descriptor = Object.getOwnPropertyDescriptor(object, key);
+      if (Object.is(before, value)) return;
+      object[key] = value;
+      if (!Object.is(object[key], value)) throw new Error('readback differs');
+      changes.push({ object, key, before, descriptor, value, nativeAccessor });
+    } catch {
+      try {
+        if (nativeAccessor) object[key] = before;
+        else if (descriptor) Object.defineProperty(object, key, descriptor);
+        else delete object[key];
+      } catch { /* frozen/unsupported objects are left alone */ }
+      warnOnce(`edit:${key}`, `Could not apply ${key}; that setting was skipped.`);
+    }
+  }
+
+  function restoreLocal() {
+    for (const change of changes.splice(0).reverse()) {
+      const { object, key, before, descriptor, value, nativeAccessor } = change;
+      try {
+        // Do not overwrite a different value installed later by the app/add-ons.
+        if (!Object.is(object[key], value)) continue;
+        if (nativeAccessor) object[key] = before;
+        else if (descriptor) Object.defineProperty(object, key, descriptor);
+        else delete object[key];
+      } catch {
+        warnOnce(`restore:${key}`, `Could not restore ${key}. Reload for a clean reset.`);
+      }
+    }
+    touched = new WeakMap();
+  }
+
+  function accessorFor(object, key) {
+    // Only accept an accessor on the prototype chain, not a user-created value.
+    if (own(object, key)) return null;
+    for (let proto = Object.getPrototypeOf(object); proto; proto = Object.getPrototypeOf(proto)) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+      if (descriptor) return typeof descriptor.set === 'function' &&
+        typeof descriptor.get === 'function' ? descriptor : null;
+    }
+    return null;
+  }
+
+  function applyLatency(record) {
+    if (!running || !latencyEnabled) return;
+    const stream = record.stream;
+    for (const receiver of record.pc.getReceivers()) {
+      if (!['video', 'audio'].includes(receiver.track?.kind) || receiver.track.readyState === 'ended') continue;
+      if (accessorFor(receiver, 'jitterBufferTarget')) {
+        edit(receiver, 'jitterBufferTarget', bufferTargetMs, true); // milliseconds
+      } else if (accessorFor(receiver, 'playoutDelayHint')) {
+        edit(receiver, 'playoutDelayHint', bufferTargetMs / 1000, true); // seconds
+      } else {
+        warnOnce('no-buffer-setter', 'No supported receiver buffer setter. Buffer tuning was skipped (no fake property added).');
+      }
+    }
+
+    const input = stream.inputChannel;
+    // Both native input channel versions read THEIR OWN configuration object.
+    // stream.updateInputConfiguration() only updates the input manager; using
+    // that method for this field would leave the actual send throttle unchanged.
+    if (input && source(input.throttleInputOrFlushData).includes('minTimeBetweenInputFramesMs')) {
+      const config = input.configuration;
+      if (config && typeof config === 'object') {
+        const current = config.minTimeBetweenInputFramesMs ?? 8;
+        if (finite(current) && current > 4) edit(config, 'minTimeBetweenInputFramesMs', 4);
+      }
+    } else if (input) {
+      warnOnce('input-shape', 'The input throttle does not match the reviewed source; input tuning was skipped.');
+    }
+
+    const manager = stream.inputManager;
+    if (manager && source(manager.pollGamepads).includes('pollGamepadsIntervalMs') &&
+        finite(manager.pollGamepadsIntervalMs) && manager.pollGamepadsIntervalMs > 4) {
+      edit(manager, 'pollGamepadsIntervalMs', 4);
+    }
+    // Do NOT use 0/1 ms timer overrides, change worker modes, alter channel
+    // reliability, resend controller packets, or fake gamepad timestamps.
+  }
+
+  function difference(a, b, key) {
+    if (!finite(a[key]) || !finite(b[key]) || b[key] < a[key]) return null;
+    return b[key] - a[key];
+  }
+
+  function intervalMetrics(a, b) {
+    const durationMs = b.timestamp - a.timestamp;
+    if (a.id !== b.id || !finite(durationMs) || durationMs <= 0 ||
+        difference(a, b, 'bytesReceived') === null) {
+      throw new Error('The video stats restarted or changed streams. Repeat the measurement.');
+    }
+    const delta = key => difference(a, b, key);
+    const decoded = delta('framesDecoded');
+    const emitted = delta('jitterBufferEmittedCount');
+    const received = delta('packetsReceived');
+    const lost = delta('packetsLost'); // null for late-packet negative adjustments
+    const perFrameMs = (key, count) => finite(delta(key)) && count > 0 ?
+      round(1000 * delta(key) / count) : null;
+    return {
+      seconds: round(durationMs / 1000),
+      incomingVideoMbps: round(8 * delta('bytesReceived') / durationMs / 1000),
+      decodedFPS: finite(decoded) ? round(decoded * 1000 / durationMs) : null,
+      decodeMsPerFrame: perFrameMs('totalDecodeTime', decoded),
+      bufferMsPerFrame: perFrameMs('jitterBufferDelay', emitted),
+      bufferTargetMsPerFrame: perFrameMs('jitterBufferTargetDelay', emitted),
+      packetLossPercent: finite(lost) && finite(received) && lost + received > 0 ?
+        round(100 * lost / (lost + received)) : null,
+      droppedFrames: delta('framesDropped'),
+      freezes: delta('freezeCount'),
+      resolution: b.frameWidth && b.frameHeight ? `${b.frameWidth}x${b.frameHeight}` : null,
+      networkJitterMsAtEnd: finite(b.jitter) ? round(b.jitter * 1000) : null,
+    };
+  }
+
+  function observe(stream, report) {
+    if (!running) return;
+    const pc = stream.peerConnection;
+    if (!pc || typeof pc.getReceivers !== 'function' || typeof pc.getStats !== 'function' ||
+        pc.connectionState === 'closed') return;
+    let record = streams.get(stream);
+    if (!record || record.pc !== pc) {
+      record = { stream, pc, id: nextSessionId++, lastSeen: 0, previous: null,
+        latest: null, bitrateRequest: null, lastRequestAt: -Infinity };
+      streams.set(stream, record);
+      // Bound retained references across repeated reconnects.
+      for (const [oldStream, old] of streams) {
+        if (oldStream !== stream && (old.pc.connectionState === 'closed' || streams.size > 8)) streams.delete(oldStream);
+      }
+      phase = 'attached';
+      log(`Attached to game stream ${record.id}. Local latency tuning ${latencyEnabled ? 'enabled' : 'disabled'}.`);
+    }
+    record.lastSeen = Date.now();
+    applyLatency(record);
+    if (report?.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
+      if (record.previous) {
+        try { record.latest = intervalMetrics(record.previous, report); }
+        catch { record.latest = null; }
+      }
+      record.previous = { ...report }; // only counters; never SDP/tokens/candidates
+    }
+  }
+
+  function activeRecord() {
+    let active;
+    for (const record of streams.values()) {
+      if (record.pc.connectionState !== 'closed' && (!active || record.lastSeen >= active.lastSeen)) active = record;
+    }
+    return active;
+  }
+
+  function requireActive() {
+    requireRunning();
+    const record = activeRecord();
+    if (!record) throw new Error('Not attached yet. Start a game and wait for the next native stats update.');
+    if (record.pc.connectionState !== 'connected') throw new Error('The game peer connection is not connected.');
+    return record;
+  }
+
+  function liveVideoExists() {
+    return Array.from(document.querySelectorAll('video')).some(video => {
+      try { return video.srcObject?.getVideoTracks().some(track => track.readyState === 'live'); }
+      catch { return false; }
+    });
+  }
+
+  function discover() {
+    if (!running || hook) return;
+    // Never force-load a lazy streaming module before a game is already showing
+    // a MediaStream. This avoids requiring an incomplete dependency graph.
+    if (!liveVideoExists()) return;
+    const chunks = W.__LOADABLE_LOADED_CHUNKS__;
+    if (!Array.isArray(chunks) || chunks.push === Array.prototype.push) {
+      phase = 'waiting for the Xbox webpack runtime';
+      return;
+    }
+    if (!runtime) {
+      const id = `${NAME}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const entry = [[id], {}, require => { runtime = require; }];
+      chunks.push(entry); // empty, unique registration; no module replacements
+      if (chunks[chunks.length - 1] === entry) chunks.pop();
+    }
+    if (!runtime?.m) throw new Error('The runtime has no reviewed module registry.');
+    const signatures = ['WebRtcStreamV1', 'rateControlBitrateUpdate', 'bitratebps',
+      'pollGamepadsIntervalMs', 'minTimeBetweenInputFramesMs', 'processInboundVideoReport'];
+    const candidates = Object.keys(runtime.m).filter(id => {
+      const text = source(runtime.m[id]);
+      return signatures.every(signature => text.includes(signature));
+    });
+    if (candidates.length !== 1) throw new Error('No unique source-compatible WebRtcStreamV1 module was found.');
+    const prototype = runtime(candidates[0])?.WebRtcStreamV1?.prototype;
+    const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'processInboundVideoReport');
+    const original = descriptor?.value;
+    if (typeof original !== 'function' || !source(original).includes('lastBytesReceived') ||
+        !source(original).includes('updateJitterBufferDelay') ||
+        !source(prototype.updateInputConfiguration).includes('inputManager')) {
+      throw new Error('Streaming methods changed or are already patched; refusing an unsafe hook.');
+    }
+    const wrapped = function processInboundVideoReport(report, summary, rows) {
+      const result = Reflect.apply(original, this, arguments);
+      try { observe(this, report); }
+      catch { warnOnce('observe-error', 'A tuning check failed. The original Xbox stats handler was left running.'); }
+      return result;
+    };
+    Object.defineProperty(prototype, 'processInboundVideoReport', { ...descriptor, value: wrapped });
+    hook = { prototype, descriptor, wrapped };
+    phase = 'waiting for the next native game stats update';
+    clearInterval(discoveryTimer);
+    // The existing Xbox stats loop calls this prototype method even when its
+    // on-screen overlay is disabled. No global WebRTC or timer APIs are replaced.
+  }
+
+  function tryDiscover() {
+    try { discover(); }
+    catch (error) {
+      phase = 'unsupported client — no tuning applied';
+      clearInterval(discoveryTimer);
+      warnOnce('discovery', `${error.message} No unsupported workaround was attempted.`);
+    }
+  }
+
+  function receiverStatus(pc) {
+    try {
+      return pc.getReceivers().filter(receiver => ['audio', 'video'].includes(receiver.track?.kind)).map(receiver => {
+        const key = accessorFor(receiver, 'jitterBufferTarget') ? 'jitterBufferTarget' :
+          accessorFor(receiver, 'playoutDelayHint') ? 'playoutDelayHint' : null;
+        return { kind: receiver.track.kind, setting: key || 'unsupported',
+          requestedBufferMs: key ? round(receiver[key] === null ? null :
+            receiver[key] * (key === 'playoutDelayHint' ? 1000 : 1)) : null };
+      });
+    } catch { return []; }
+  }
+
+  function status() {
+    const record = activeRecord();
+    return {
+      name: NAME, version: '1.0.0', running, phase,
+      latencyEnabled, preferredBufferMs: bufferTargetMs,
+      session: record?.id ?? null,
+      connection: record?.pc.connectionState ?? null,
+      statsAgeSeconds: record ? round((Date.now() - record.lastSeen) / 1000) : null,
+      receivers: record ? receiverStatus(record.pc) : [],
+      mouseTouchThrottleMs: record ? record.stream.inputChannel?.configuration?.minTimeBetweenInputFramesMs ?? 8 : null,
+      gamepadPollMs: record?.stream.inputManager?.pollGamepadsIntervalMs ?? null,
+      recentVideo: record?.latest ? { ...record.latest } : null,
+      bitrateRequest: record?.bitrateRequest ? { ...record.bitrateRequest } : null,
+      note: 'Requested settings are not measured input lag or proof of server bitrate acceptance.',
+    };
+  }
+
+  function latency(enabled = true, targetMs = 0) {
+    requireRunning();
+    if (typeof enabled !== 'boolean' || !finite(targetMs) || targetMs < 0 || targetMs > 200) {
+      throw new TypeError('Use latency(true/false, bufferMilliseconds), with a target from 0 to 200.');
+    }
+    settingsVersion++;
+    restoreLocal();
+    latencyEnabled = enabled;
+    bufferTargetMs = targetMs;
+    if (enabled) for (const record of streams.values()) applyLatency(record);
+    log(enabled ? `Local tuning on; audio/video buffer preference ${targetMs} ms (best effort).` :
+      'Local tuning restored to its previous values. Any server bitrate request is unchanged.');
+    return status();
+  }
+
+  function bitrate(mbps) {
+    const record = requireActive();
+    if (!finite(mbps) || mbps < 1 || mbps > 50) throw new RangeError('Bitrate must be a number from 1 to 50 Mbps.');
+    if (Date.now() - record.lastRequestAt < 5000) throw new Error('Wait 5 seconds between bitrate requests.');
+    const control = record.stream.getControlChannel?.();
+    const nativeMethod = source(control?.sendRateControlBitrateUpdate);
+    const channel = control?.controlChannel?.dataChannel;
+    if (!nativeMethod.includes('rateControlBitrateUpdate') || !nativeMethod.includes('bitratebps') ||
+        !channel || channel.label !== 'control' || channel.protocol !== 'controlV1') {
+      throw new Error('The bitrate helper/transport does not match the reviewed code. Nothing was sent.');
+    }
+    if (channel.readyState !== 'open' || !finite(channel.bufferedAmount) || channel.bufferedAmount > 65536) {
+      throw new Error('The control channel is closed or backed up. Nothing was sent.');
+    }
+    // Exact native wire format. Direct send lets us detect a local exception;
+    // the site's helper catches its own errors and returns no success flag.
+    const payload = JSON.stringify({ message: 'rateControlBitrateUpdate', bitratebps: Math.floor(mbps * 1000000) });
+    channel.send(payload);
+    settingsVersion++;
+    record.lastRequestAt = Date.now();
+    record.bitrateRequest = { requestedMbps: mbps, status: 'queued locally; server acceptance unknown' };
+    log(`Queued a ${mbps} Mbps request. This may be ignored/capped; more bitrate can also increase latency.`);
+    warnOnce('server-reset', 'No verified server reset value exists in the capture. Restart the game stream for a complete bitrate reset.');
+    return { ...record.bitrateRequest };
+  }
+
+  async function snapshot(record) {
+    const reports = await record.pc.getStats();
+    const videos = Array.from(reports.values()).filter(report => report.type === 'inbound-rtp' &&
+      (report.kind === 'video' || report.mediaType === 'video') && !report.isRemote);
+    const video = videos.find(report => report.ssrc === record.stream.videoSSRC) ||
+      videos.sort((a, b) => (b.framesDecoded || 0) - (a.framesDecoded || 0))[0];
+    if (!video || !finite(video.bytesReceived)) throw new Error('No inbound video counters yet.');
+    let pair = reports.get(reports.get(video.transportId)?.selectedCandidatePairId);
+    if (!pair) {
+      const transports = Array.from(reports.values()).filter(report => report.type === 'transport' && report.selectedCandidatePairId);
+      if (transports.length === 1) pair = reports.get(transports[0].selectedCandidatePairId);
+    }
+    if (!pair) {
+      const selected = Array.from(reports.values()).filter(report => report.type === 'candidate-pair' && report.selected === true);
+      if (selected.length === 1) pair = selected[0];
+    }
+    return { video: { ...video }, codec: reports.get(video.codecId)?.mimeType ?? null,
+      iceRttMs: finite(pair?.currentRoundTripTime) ? round(pair.currentRoundTripTime * 1000) : null };
+  }
+
+  function wait(ms) {
+    return new Promise((resolve, reject) => {
+      const item = { timer: null, reject };
+      item.timer = setTimeout(() => { waits.delete(item); resolve(); }, ms);
+      waits.add(item);
+    });
+  }
+
+  async function measure(seconds = 15) {
+    const record = requireActive();
+    if (!finite(seconds) || seconds < 3 || seconds > 60) throw new RangeError('Measure for 3–60 seconds.');
+    if (measuring) throw new Error('A measurement is already running.');
+    measuring = true;
+    const initialVersion = settingsVersion;
+    let wasHidden = document.visibilityState !== 'visible';
+    const onVisibility = () => { if (document.visibilityState !== 'visible') wasHidden = true; };
+    document.addEventListener('visibilitychange', onVisibility);
+    try {
+      log(`Measuring for ${seconds} seconds. Keep the game tab visible and use a comparable moving scene.`);
+      const before = await snapshot(record);
+      requireRunning();
+      await wait(seconds * 1000);
+      requireRunning();
+      const after = await snapshot(record);
+      requireRunning();
+      if (activeRecord() !== record || record.pc.connectionState !== 'connected') throw new Error('The stream changed/disconnected during measurement.');
+      if (settingsVersion !== initialVersion) throw new Error('Optimizer settings changed during measurement. Repeat with stable settings.');
+      if (wasHidden) throw new Error('The game tab was hidden; background throttling makes this comparison invalid. Repeat with the tab visible.');
+      const result = { ...intervalMetrics(before.video, after.video), codec: after.codec,
+        iceRttMsAtEnd: after.iceRttMs,
+        note: 'Video counters and ICE RTT only — not end-to-end input lag. Scene changes affect bitrate.' };
+      console.table(result);
+      return result;
+    } finally {
+      document.removeEventListener('visibilitychange', onVisibility);
+      measuring = false;
+    }
+  }
+
+  function stop() {
+    if (!running) return;
+    const requestedBitrate = Array.from(streams.values()).some(record => record.bitrateRequest);
+    running = false;
+    latencyEnabled = false;
+    clearInterval(discoveryTimer);
+    clearTimeout(noticeTimer);
+    for (const item of waits) { clearTimeout(item.timer); item.reject(new Error('Measurement cancelled: optimizer stopped.')); }
+    waits.clear();
+    restoreLocal();
+    if (hook && hook.prototype.processInboundVideoReport === hook.wrapped) {
+      Object.defineProperty(hook.prototype, 'processInboundVideoReport', hook.descriptor);
+    }
+    hook = null;
+    runtime = null;
+    streams.clear();
+    phase = 'stopped';
+    if (W[NAME] === api) delete W[NAME];
+    log('Stopped. Local settings restored; the game connection was not closed.');
+    if (requestedBitrate) warn('Restart the game stream to undo the server bitrate request; no unverified reset message was sent.');
+  }
+
+  const api = Object.freeze({ tag: TAG, status, latency, bitrate, measure, stop,
+    help() {
+      log('status(); latency(false); latency(true, 10); await measure(15); bitrate(25); stop(). Prefix each with xcloudoptimizer.');
+      return 'Defaults are latency-only. A zero buffer preference is best effort, not zero latency. Stop if audio/video becomes unstable.';
+    },
+  });
+  Object.defineProperty(W, NAME, { configurable: true, value: api });
+  discoveryTimer = setInterval(tryDiscover, 1000);
+  noticeTimer = setTimeout(() => {
+    if (!streams.size && running) log(`Still ${phase}. Start/resume a game; reloads require pasting the script again.`);
+  }, 12000);
+  log('Installed. Waiting for a native game stream. No bitrate request is sent automatically.');
+  log('If playback stutters or audio crackles, run xcloudoptimizer.latency(false).');
+  tryDiscover();
+  return api;
+})();
+//# sourceURL=xcloudoptimizer.js
