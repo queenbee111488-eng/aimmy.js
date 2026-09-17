@@ -55,7 +55,7 @@ const config = {
         lineWidth: 1,
     },
     aim: {
-        positionSmoothing: false, // Disabled for continuous, direct aiming
+        positionSmoothing: true, // Disabled for continuous, direct aiming
         historySize: 0, // No history used
         targetPriority: "closest",
         aimPoint: "center",
